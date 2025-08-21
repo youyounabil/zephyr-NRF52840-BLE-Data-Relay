@@ -40,49 +40,62 @@
 #define LOG_MODULE_NAME peripheral_uart
 LOG_MODULE_REGISTER(LOG_MODULE_NAME);
 
+/* ======================= General Configuration ======================= */
 #define STACKSIZE CONFIG_BT_NUS_THREAD_STACK_SIZE
 #define PRIORITY  7
 
 #define DEVICE_NAME	CONFIG_BT_DEVICE_NAME
 #define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
 
+/* LED definitions for status indication */
 #define RUN_STATUS_LED	       DK_LED1
 #define RUN_LED_BLINK_INTERVAL 1000
-
 #define CON_STATUS_LED DK_LED2
 
+/* Buttons for passkey handling */
 #define KEY_PASSKEY_ACCEPT DK_BTN1_MSK
 #define KEY_PASSKEY_REJECT DK_BTN2_MSK
 
+/* UART buffer sizes */
 #define UART_BUF_SIZE		CONFIG_BT_NUS_UART_BUFFER_SIZE
 #define UART_WAIT_FOR_BUF_DELAY K_MSEC(50)
 #define UART_WAIT_FOR_RX	CONFIG_BT_NUS_UART_RX_WAIT_TIME
 
+/* Role states */
 #define central 2
 #define peripheral 1
 
+/* Semaphore used by central writer thread */
 K_SEM_DEFINE(send_sem, 0, 1);
 #define WRITE_THREAD_STACKSIZE 1024
 #define WRITE_THREAD_PRIORITY  7
 
+/* Current role status: default = peripheral */
 static uint8_t status = peripheral;
 
+/* Forward declaration */
 void status_function (void);
 
+/* Name of the peripheral device we want to connect to (Board B) */
 static const char target_name[] = "Nordic_Peripheral";
+
+/* Buffer for outgoing messages */
 static char tx_msg[50] = {0};
 
-
+/* Semaphore used to wait until BLE is initialized */
 static K_SEM_DEFINE(ble_init_ok, 0, 1);
 
-static struct bt_conn *current_conn;
-static struct bt_conn *auth_conn;
-static struct bt_conn *default_conn;
+/* BLE connection references */
+static struct bt_conn *current_conn; /* Peripheral role connection (to phone) */
+static struct bt_conn *auth_conn;	 /* Temporary ref during authentication */
+static struct bt_conn *default_conn; /* Central role connection (to Board B) */
 
+/* Variables for service discovery and writes in central role */
 static struct bt_gatt_discover_params discover_params;
 static struct bt_gatt_write_params write_params;
-static uint16_t char_handle = 0;
+static uint16_t char_handle = 0;    /* Handle of the custom characteristic on Board B */
 
+/* Example custom UUID (used on Board B characteristic) */
 /* Custom Characteristic UUID: abcdefab-cdef-4567-89ab-cdef12345678 */
 static struct bt_uuid_128 custom_char_uuid = BT_UUID_INIT_128(
 	0x78, 0x56, 0x34, 0x12,
@@ -91,8 +104,10 @@ static struct bt_uuid_128 custom_char_uuid = BT_UUID_INIT_128(
 	0xab, 0xef, 0xcd, 0xab
 );
 
+/* UART device handle */
 static const struct device *uart = DEVICE_DT_GET(DT_CHOSEN(nordic_nus_uart));
 static struct k_work_delayable uart_work;
+
 /*  Declare the struct of the data item of the FIFOs */
 struct uart_data_t {
 	void *fifo_reserved;
@@ -103,11 +118,13 @@ struct uart_data_t {
 static K_FIFO_DEFINE(fifo_uart_tx_data); 
 static K_FIFO_DEFINE(fifo_uart_rx_data);
 
+/* BLE advertising data */
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
 	BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN),
 };
 
+/* Scan response: advertise NUS UUID */
 static const struct bt_data sd[] = {
 	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_NUS_VAL),
 };
@@ -118,6 +135,13 @@ UART_ASYNC_ADAPTER_INST_DEFINE(async_adapter);
 #define async_adapter NULL
 #endif
 
+/* ======================= UART Handling ======================= */
+/**
+* @brief UART event callback handler
+*
+* Handles RX ready, TX done, buffer requests, etc. Buffers are
+* dynamically allocated and pushed to FIFOs for processing.
+*/
 static void uart_cb(const struct device *dev, struct uart_event *evt, void *user_data)
 {
 	ARG_UNUSED(dev);
@@ -233,6 +257,7 @@ static void uart_cb(const struct device *dev, struct uart_event *evt, void *user
 	}
 }
 
+/* Work handler: re-enable UART RX after buffer shortage */
 static void uart_work_handler(struct k_work *item)
 {
 	struct uart_data_t *buf;
@@ -249,6 +274,7 @@ static void uart_work_handler(struct k_work *item)
 	uart_rx_enable(uart, buf->data, sizeof(buf->data), UART_WAIT_FOR_RX);
 }
 
+/* Helper to test if async UART API is available */
 static bool uart_test_async_api(const struct device *dev)
 {
 	const struct uart_driver_api *api = (const struct uart_driver_api *)dev->api;
@@ -367,6 +393,11 @@ static int uart_init(void)
 	return err;
 }
 
+/* ======================= Central Role (Writer Thread) ======================= */
+/**
+* @brief Thread to periodically write data to the custom characteristic
+* on the connected peripheral (Board B).
+*/
 void writer_thread(void)
 {
 	int rc;
@@ -406,7 +437,10 @@ void writer_thread(void)
 K_THREAD_DEFINE(writer_thread_id, WRITE_THREAD_STACKSIZE, writer_thread, NULL, NULL, NULL,
 	WRITE_THREAD_PRIORITY, 0, 0);
 
-
+/* ======================= Central Role Discovery ======================= */
+/**
+* @brief Callback for GATT discovery results
+*/
 static uint8_t discover_func(struct bt_conn *conn,
 			     const struct bt_gatt_attr *attr,
 			     struct bt_gatt_discover_params *params)
@@ -414,7 +448,6 @@ static uint8_t discover_func(struct bt_conn *conn,
 	if (!attr) {
 		LOG_ERR("Discover complete\n");
 		(void)memset(params, 0, sizeof(*params));
-        LOG_ERR("7mada\n");
 		return BT_GATT_ITER_STOP;
 	}
 
@@ -439,6 +472,8 @@ static uint8_t discover_func(struct bt_conn *conn,
 	return BT_GATT_ITER_CONTINUE;
 }
 
+/* ======================= Scanner and Connection Callbacks ======================= */
+/* Parse advertising data to match target device name */
 static bool name_matches(struct net_buf_simple *ad)
 {
 	struct bt_data data;
@@ -469,7 +504,7 @@ static bool name_matches(struct net_buf_simple *ad)
 	return false;
 }
 
-
+/* Callback for scanning: called when devices are found */
 static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 			 struct net_buf_simple *ad)
 {
@@ -509,6 +544,7 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 	}
 }
 
+/* Called on connection complete */
 static void connected(struct bt_conn *conn, uint8_t err)
 {
 	switch (status)
@@ -566,6 +602,7 @@ static void connected(struct bt_conn *conn, uint8_t err)
 
 }
 
+/* Called on disconnection */
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
 	char addr[BT_ADDR_LE_STR_LEN];
@@ -591,6 +628,8 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	status_function();
 }
 
+/* ======================= Security Handling (optional) ======================= */
+/* Handles passkey, pairing, confirmation, etc. */
 #ifdef CONFIG_BT_NUS_SECURITY_ENABLED
 static void security_changed(struct bt_conn *conn, bt_security_t level, enum bt_security_err err)
 {
@@ -681,6 +720,13 @@ static struct bt_conn_auth_cb conn_auth_callbacks;
 static struct bt_conn_auth_info_cb conn_auth_info_callbacks;
 #endif
 
+/* ======================= NUS Receive Callback ======================= */
+/**
+* @brief Callback when data is received via NUS service from phone
+*
+* Data is forwarded to UART and also stored in tx_msg for later sending
+* to Board B.
+*/
 static void bt_receive_cb(struct bt_conn *conn, const uint8_t *const data, uint16_t len)
 {
 	int err;
@@ -728,6 +774,7 @@ static void bt_receive_cb(struct bt_conn *conn, const uint8_t *const data, uint1
 	}
 }
 /*  Create a variable of type bt_nus_cb and initialize it */
+/* Register NUS callbacks */
 static struct bt_nus_cb nus_cb = {
 	.received = bt_receive_cb,
 };
@@ -801,17 +848,20 @@ static void start_scan(void)
 	LOG_ERR("Scanning started\n");
 }
 
+/* ======================= Main Application ======================= */
 int main(void)
 {
 	int blink_status = 0;
 	int err = 0;
 
+	/* Configure GPIOs for LEDs (and buttons if security enabled) */
 	configure_gpio();
 	/* Initialize the UART Peripheral  */
-		err = uart_init();
+	err = uart_init();
 	if (err) {
 		error();
 	}
+
 	if (IS_ENABLED(CONFIG_BT_NUS_SECURITY_ENABLED)) {
 		err = bt_conn_auth_cb_register(&conn_auth_callbacks);
 		if (err) {
@@ -825,6 +875,7 @@ int main(void)
 			return 0;
 		}
 	}
+	/* Initialize Bluetooth stack */
 	err = bt_enable(NULL);
 	if (err) {
 		LOG_ERR("error in starting ble");
@@ -834,8 +885,9 @@ int main(void)
 
 	k_sem_give(&ble_init_ok);
 
+	/* Load persistent settings if available */
 	if (IS_ENABLED(CONFIG_SETTINGS)) {
-		settings_load();
+	settings_load();
 	}
 	/* Pass your application callback function to the NUS service */
 	err = bt_nus_init(&nus_cb);
@@ -844,12 +896,14 @@ int main(void)
 		return 0;
 	}
 
-		status_function();
+	/* Start in peripheral role (advertising) */
+	status_function();
 	
-		for(;;){
+	/* Blink LED1 to show alive status */
+	for(;;){
 		dk_set_led(RUN_STATUS_LED, (++blink_status) % 2);
 		k_sleep(K_MSEC(RUN_LED_BLINK_INTERVAL));
-		}	
+	}	
 }
 /*  Define the thread function  */
 void ble_write_thread(void)
@@ -892,6 +946,13 @@ void ble_write_thread(void)
 K_THREAD_DEFINE(ble_write_thread_id, STACKSIZE, ble_write_thread, NULL, NULL,
 		NULL, PRIORITY, 0, 0);
 
+/* ======================= Role Switching Logic ======================= */
+/**
+* @brief Switch role between peripheral and central depending on state
+*
+* Peripheral role: start advertising to phone.
+* Central role: scan for target peripheral (Board B).
+*/
 void status_function(void){
 	int err;
 switch (status)
